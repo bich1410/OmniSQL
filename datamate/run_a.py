@@ -13,7 +13,7 @@ from collections import defaultdict
 from pathlib import Path
 
 from common import (build_db, build_prompt, extract_sql, read_jsonl, read_text, run_sql,
-                    schema_text, to_answer, write_jsonl)
+                    schema_text, select_rulebook, select_tables, to_answer, write_jsonl)
 
 CHARS_PER_TOKEN = 2.2          # ước lượng thô cho tiếng Việt, an toàn hơn tiếng Anh
 MAX_PROMPT_TOKENS = 6500       # model huấn luyện với ngữ cảnh 8192, chừa chỗ cho phần suy luận
@@ -24,10 +24,16 @@ def est_tokens(s: str) -> int:
 
 
 def fit_prompt(tables_info, question, as_of, readme, rulebook):
-    """Co dần các phần phụ cho tới khi prompt vừa ngân sách token."""
-    for n_ex, rb_lim, rd_lim in [(2, 3000, 1500), (2, 1500, 800), (1, 800, 400), (0, 400, 0)]:
-        schema = schema_text(tables_info["db"], tables_info["tables"], n_examples=n_ex)
-        p = build_prompt(schema, question, as_of, readme[:rd_lim], rulebook[:rb_lim])
+    """Co dần các phần phụ cho tới khi prompt vừa ngân sách token.
+    Bảng chọn theo liên quan câu hỏi (select_tables) vì nhiều business có 20-28 bảng
+    (mỗi file/sheet Excel một bảng) -> schema một mình đã vượt ngân sách.
+    Rulebook chọn theo mục liên quan câu hỏi (select_rulebook), không cắt thô."""
+    for max_t, n_ex, rb_lim, rd_lim in [(12, 2, 6000, 1500), (8, 1, 3000, 800),
+                                         (6, 1, 1500, 400), (4, 0, 600, 0)]:
+        tables = select_tables(question, tables_info["tables"], max_tables=max_t)
+        schema = schema_text(tables_info["db"], tables, n_examples=n_ex)
+        rb = select_rulebook(question, rulebook, rb_lim)
+        p = build_prompt(schema, question, as_of, readme[:rd_lim], rb)
         if est_tokens(p) <= MAX_PROMPT_TOKENS:
             return p
     return p  # đành chịu; log sẽ cho biết

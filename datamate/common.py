@@ -143,6 +143,37 @@ def _short(v, n=40):
     return s if len(s) <= n else s[: n - 1] + "…"
 
 
+def select_tables(question: str, tables, max_tables=10, small_cols=6):
+    """Nhiều business có tới 20-28 'bảng' (mỗi file/sheet Excel một bảng) -> schema
+    một mình đã vượt ngân sách prompt. Chọn bảng nhỏ (danh mục: sản phẩm, khách hàng,
+    quy đổi...) luôn giữ vì bảng giao dịch lớn cần join tới chúng để lấy tên; bảng lớn
+    chỉ giữ khi tên bảng/cột khớp từ khóa câu hỏi."""
+    if len(tables) <= max_tables:
+        return tables
+    qwords = set(re.findall(r"[a-z0-9]+", strip_accents(question).lower()))
+
+    def score(t):
+        blob = " ".join([t["name"]] + [c[0] for c in t["cols"]] + [str(c[1]) for c in t["cols"]])
+        blob_words = set(re.findall(r"[a-z0-9]+", strip_accents(blob).lower()))
+        return len(qwords & blob_words)
+
+    small = [t for t in tables if len(t["cols"]) <= small_cols]
+    big = [t for t in tables if len(t["cols"]) > small_cols]
+    big_scored = sorted(big, key=score, reverse=True)
+    picked = list(small)
+    for t in big_scored:
+        if len(picked) >= max_tables:
+            break
+        if t not in picked:
+            picked.append(t)
+    # vẫn thiếu chỗ (quá nhiều bảng nhỏ) -> cắt bớt bảng nhỏ ít liên quan nhất
+    if len(picked) > max_tables:
+        picked.sort(key=lambda t: (-score(t), t["name"]))
+        picked = picked[:max_tables]
+    names = {t["name"] for t in picked}
+    return [t for t in tables if t["name"] in names]  # giữ thứ tự gốc
+
+
 def schema_text(db_path: Path, tables, n_examples=2) -> str:
     """Schema dạng CREATE TABLE + chú thích 'example: [...]' (đúng kiểu OmniSQL được huấn luyện)."""
     con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
@@ -179,6 +210,57 @@ def read_text(path: Path, limit: int) -> str:
     except Exception:
         return ""
     return s if len(s) <= limit else s[:limit] + "\n...[cắt bớt]"
+
+
+# ------------------------------------------------- chọn mục rulebook theo câu hỏi
+# Rulebook thật (~14.650 ký tự, ~6.700 token) đã vượt NGÂN SÁCH PROMPT một mình nó.
+# Cắt thô theo số ký tự (cách cũ) làm mất phần lớn luật mà không biết mất chỗ nào.
+# Thay vào đó: luôn giữ §7-10 (ngắn, áp dụng MỌI câu: không trả lời được, cách đọc
+# file, định dạng đáp án, từ ngữ); §1-6 (luật theo chủ đề) chỉ giữ mục khớp từ khóa
+# trong câu hỏi.
+_RULEBOOK_ALWAYS = {7, 8, 9, 10}
+_RULEBOOK_KEYWORDS = {
+    1: ["doanh thu", "don hang", "huy", "tra hang", "cod", "ghi no", "nhom khach",
+        "thanh toan", "tang truong", "chenh lech", "hon kem", "ty le don"],
+    2: ["hom nay", "hom qua", "tuan", "thang", "quy ", "tet", "ca sang", "ca chieu",
+        "ngay ", "gan nhat", "tu dau nam"],
+    3: ["ban chay", "hot nhat", "nhieu nhat", "it nhat", "xep hang", "top ",
+        "nhom hang", "khach hang", "nhan vien", "trung binh mot don", "mat hang"],
+    4: ["no", "cong no", "tuoi no", "con no"],
+    5: ["ton kho", "nhap hang", "gia von", "lai gop", "lai rong", "het hang", "e ",
+        "khong ban duoc", "gia ban", "tang gia", "nha cung cap"],
+    6: ["ca phe", "size", "thuoc", "ke don", "hoat chat", "han dung", "han su dung",
+        "lo hang", "vat lieu xay dung", "dot giao"],
+}
+
+
+def split_rulebook_sections(rulebook: str):
+    """Tách rulebook theo '## N. Tiêu đề' -> {số: (tiêu đề, nội dung)}, và phần mở đầu."""
+    parts = re.split(r"(?m)^## (\d+)\. (.+)$", rulebook)
+    preamble = parts[0]
+    sections = {}
+    for i in range(1, len(parts), 3):
+        num = int(parts[i])
+        sections[num] = (parts[i + 1], parts[i + 2])
+    return preamble, sections
+
+
+def select_rulebook(question: str, rulebook: str, char_cap: int) -> str:
+    """Chọn phần rulebook liên quan câu hỏi thay vì cắt thô theo ký tự."""
+    preamble, sections = split_rulebook_sections(rulebook)
+    if not sections:  # không đúng định dạng mong đợi -> fallback cắt thô
+        return rulebook[:char_cap]
+    qn = strip_accents(question).lower()
+    keep = set(_RULEBOOK_ALWAYS) & set(sections)
+    for num, kws in _RULEBOOK_KEYWORDS.items():
+        if num in sections and any(k in qn for k in kws):
+            keep.add(num)
+    out = [preamble.strip()]
+    for num in sorted(keep):
+        title, body = sections[num]
+        out.append(f"## {num}. {title}{body}".strip())
+    text = "\n\n".join(out)
+    return text if len(text) <= char_cap else text[:char_cap] + "\n...[cắt bớt]"
 
 
 def build_prompt(schema: str, question: str, as_of: str, readme: str, rulebook: str) -> str:
