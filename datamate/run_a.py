@@ -1,10 +1,11 @@
-"""Nấc A: OmniSQL-7B sinh một SQL (greedy) -> chạy trên SQLite -> định dạng đáp án.
-Không có abstain thông minh: SQL lỗi / kết quả rỗng thì abstain (điểm 0, không bị -1).
+"""Nấc A + Bước 1: OmniSQL-7B sinh n SQL (1 greedy + n-1 lấy mẫu) -> chạy trên SQLite
+-> định dạng đáp án -> BỎ PHIẾU giữa các candidate -> abstain nếu độ đồng thuận thấp.
+(--n 1 cho đúng hành vi nấc A cũ: một SQL greedy, SQL lỗi / kết quả rỗng thì abstain.)
 
 Dùng:
   python run_a.py --split_dir /kaggle/input/<ten-dataset>/public_test \
-                  --out /kaggle/working/submission.jsonl --backend vllm
-  (train: thêm --limit 300 để chạy thử một phần; rồi chấm bằng score.py)
+                  --out /kaggle/working/submission.jsonl --backend vllm --n 4
+  (train: thêm --limit 300 để chạy thử một phần; chấm bằng score.py, chọn ngưỡng bằng calibrate.py)
 """
 import argparse
 import json
@@ -14,6 +15,7 @@ from pathlib import Path
 
 from common import (build_db, build_prompt, extract_sql, read_jsonl, read_text, run_sql,
                     schema_text, select_rulebook, select_tables, to_answer, write_jsonl)
+from vote import apply_threshold, vote
 
 CHARS_PER_TOKEN = 2.2          # ước lượng thô cho tiếng Việt, an toàn hơn tiếng Anh
 MAX_PROMPT_TOKENS = 6500       # model huấn luyện với ngữ cảnh 8192, chừa chỗ cho phần suy luận
@@ -39,9 +41,19 @@ def fit_prompt(tables_info, question, as_of, readme, rulebook):
     return p  # đành chịu; log sẽ cho biết
 
 
-def generate(prompts, backend, model, batch_size, oracle=None, ids=None, tp=1, quant="none"):
-    if backend == "stub":  # kiểm thử luồng, không cần GPU: đọc SQL có sẵn
-        return [f"```sql\n{oracle.get(i, 'SELECT * FROM khong_co_bang')}\n```" for i in ids]
+def generate(prompts, backend, model, batch_size, n=4, temperature=0.7,
+             oracle=None, ids=None, tp=1, quant="none"):
+    """Mỗi prompt trả về danh sách n chuỗi: [0] = greedy (như nấc A), [1:] = n-1 bản lấy mẫu.
+    k = n-1 bản lấy mẫu dùng temperature > 0 để các bản khác nhau, nếu không sẽ giống hệt greedy."""
+    k = max(0, n - 1)
+    if backend == "stub":  # kiểm thử luồng, không cần GPU: oracle[id] là một SQL hoặc danh sách SQL
+        res = []
+        for i in ids:
+            sqls = oracle.get(i, "SELECT * FROM khong_co_bang")
+            sqls = [sqls] if isinstance(sqls, str) else list(sqls)
+            sqls = (sqls + [sqls[-1]] * n)[:n]      # thiếu thì lặp lại bản cuối
+            res.append([f"```sql\n{s}\n```" for s in sqls])
+        return res
     if backend == "vllm":
         from transformers import AutoTokenizer
         from vllm import LLM, SamplingParams
@@ -51,8 +63,14 @@ def generate(prompts, backend, model, batch_size, oracle=None, ids=None, tp=1, q
                   disable_custom_all_reduce=True, trust_remote_code=True)
         chats = [tok.apply_chat_template([{"role": "user", "content": p}],
                                          add_generation_prompt=True, tokenize=False) for p in prompts]
-        outs = llm.generate(chats, SamplingParams(temperature=0, max_tokens=2048, n=1))
-        return [o.outputs[0].text for o in outs]
+        res = [[o.outputs[0].text] for o in
+               llm.generate(chats, SamplingParams(temperature=0, max_tokens=2048, n=1))]
+        if k:  # n=k: vLLM sinh k bản cho mỗi prompt, prefill (đọc prompt dài) chỉ tính một lần
+            samp = llm.generate(chats, SamplingParams(temperature=temperature, top_p=0.95,
+                                                      max_tokens=2048, n=k))
+            for r, o in zip(res, samp):
+                r.extend(c.text for c in o.outputs)
+        return res
     # backend "hf": chậm hơn nhưng ít lỗi cài đặt hơn (dùng khi vLLM không cài được)
     import torch
     from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -73,7 +91,14 @@ def generate(prompts, backend, model, batch_size, oracle=None, ids=None, tp=1, q
         with torch.no_grad():
             out = mdl.generate(**enc, max_new_tokens=1024, do_sample=False)
         for j, i in enumerate(idx):
-            res[i] = tok.decode(out[j][enc.input_ids.shape[1]:], skip_special_tokens=True)
+            res[i] = [tok.decode(out[j][enc.input_ids.shape[1]:], skip_special_tokens=True)]
+        if k:  # num_return_sequences=k: mỗi đầu vào sinh k bản, xếp liền nhau trong out
+            with torch.no_grad():
+                out = mdl.generate(**enc, max_new_tokens=1024, do_sample=True, temperature=temperature,
+                                   top_p=0.95, num_return_sequences=k)
+            for j, i in enumerate(idx):
+                res[i].extend(tok.decode(out[j * k + t][enc.input_ids.shape[1]:], skip_special_tokens=True)
+                              for t in range(k))
         print(f"  hf: {min(s + batch_size, len(order))}/{len(order)}", flush=True)
     return res
 
@@ -90,7 +115,11 @@ def main():
     ap.add_argument("--tp", type=int, default=1, help="số GPU chia cho vLLM (Kaggle T4x2 -> 2)")
     ap.add_argument("--quant", choices=["none", "4bit"], default="none", help="chỉ backend hf")
     ap.add_argument("--limit", type=int, default=0, help="chỉ chạy N câu đầu (thử nhanh)")
-    ap.add_argument("--oracle", default=None, help="(stub) json id -> SQL")
+    ap.add_argument("--oracle", default=None, help="(stub) json id -> SQL hoặc danh sách SQL")
+    ap.add_argument("--n", type=int, default=4, help="số candidate mỗi câu (1 greedy + n-1 lấy mẫu); 1 = nấc A cũ")
+    ap.add_argument("--temperature", type=float, default=0.7, help="nhiệt độ cho các bản lấy mẫu")
+    ap.add_argument("--threshold", type=float, default=0.5,
+                    help="chỉ trả lời khi độ đồng thuận >= ngưỡng. 0.5 chỉ là giá trị TẠM, chọn bằng calibrate.py")
     a = ap.parse_args()
 
     split = Path(a.split_dir)
@@ -128,30 +157,48 @@ def main():
     live = [i for i, m in enumerate(metas) if m["err"] is None]
     oracle = json.load(open(a.oracle, encoding="utf-8")) if a.oracle else None
     t_gen = time.time()
-    outs = generate([prompts[i] for i in live], a.backend, a.model, a.batch_size,
-                    oracle=oracle, ids=[metas[i]["q"]["id"] for i in live], tp=a.tp, quant=a.quant)
+    outs = generate([prompts[i] for i in live], a.backend, a.model, a.batch_size, n=a.n,
+                    temperature=a.temperature, oracle=oracle,
+                    ids=[metas[i]["q"]["id"] for i in live], tp=a.tp, quant=a.quant)
     gen_s = time.time() - t_gen
-    raw = {i: o for i, o in zip(live, outs)}
+    raw = {i: o for i, o in zip(live, outs)}     # raw[i] = danh sách n chuỗi, [0] là greedy
     per_q = gen_s / max(1, len(live))
 
-    submission, logs = [], []
+    submission, logs, cache = [], [], {}
     for i, m in enumerate(metas):
         q = m["q"]
         t0 = time.time()
-        sql, ans, err = None, {"type": "abstain"}, m["err"]
-        if err is None:
-            sql = extract_sql(raw[i])
+        cands, cand_logs = [], []                 # đáp án + nhật ký từng candidate
+        for text in raw.get(i, []):
+            sql, ans, err = extract_sql(text), {"type": "abstain"}, None
             if sql is None:
                 err = "không tách được SQL"
             else:
-                try:
-                    cols, rows = run_sql(m["db"], sql)
-                    ans = to_answer(q["question"], cols, rows)
-                except Exception as e:
-                    err = f"SQL lỗi: {e}"
+                key = (str(m["db"]), sql)         # nhiều candidate trùng SQL thì chỉ chạy một lần
+                if key not in cache:              # chỉ cache kết quả chạy; to_answer còn phụ thuộc câu hỏi
+                    try:
+                        cache[key] = run_sql(m["db"], sql)
+                    except Exception as e:
+                        cache[key] = e
+                res_or_err = cache[key]
+                if isinstance(res_or_err, Exception):
+                    err = f"SQL lỗi: {res_or_err}"
+                else:
+                    ans = to_answer(q["question"], *res_or_err)
+            cands.append(ans)
+            cand_logs.append({"sql": sql, "answer": ans, "error": err})
+        if m["err"] is not None or not cands:    # lỗi nạp dữ liệu -> abstain cả câu
+            voted, conf, win = {"type": "abstain"}, 0.0, None
+        else:
+            voted, conf, win = vote(cands)
+        ans = apply_threshold(voted, conf, a.threshold)
         submission.append({"id": q["id"], **ans})
-        logs.append({"id": q["id"], "answer": ans, "elapsed_s": round(per_q + time.time() - t0, 3),
-                     "sql": sql, "error": err, "model_output": raw.get(i)})
+        # "sql"/"error"/"model_output" giữ như nấc A (candidate greedy); "candidates" để calibrate.py quét ngưỡng
+        logs.append({"id": q["id"], "answer": ans, "voted_answer": voted, "confidence": round(conf, 4),
+                     "winner": win, "elapsed_s": round(per_q + time.time() - t0, 3),
+                     "sql": cand_logs[0]["sql"] if cand_logs else None,
+                     "error": m["err"] or (cand_logs[0]["error"] if cand_logs else None),
+                     "model_output": raw[i][0] if i in raw else None, "candidates": cand_logs})
 
     write_jsonl(Path(a.out), submission)
     write_jsonl(log_dir / "logs.jsonl", logs)
