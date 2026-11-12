@@ -143,16 +143,19 @@ def _short(v, n=40):
     return s if len(s) <= n else s[: n - 1] + "…"
 
 
-def select_tables(question: str, tables, max_tables=10, small_cols=6):
+def select_tables(question: str, tables, max_tables=10, small_cols=6, scorer=None):
     """Nhiều business có tới 20-28 'bảng' (mỗi file/sheet Excel một bảng) -> schema
     một mình đã vượt ngân sách prompt. Chọn bảng nhỏ (danh mục: sản phẩm, khách hàng,
     quy đổi...) luôn giữ vì bảng giao dịch lớn cần join tới chúng để lấy tên; bảng lớn
-    chỉ giữ khi tên bảng/cột khớp từ khóa câu hỏi."""
+    chỉ giữ khi tên bảng/cột khớp từ khóa câu hỏi.
+    scorer (Bước 3): hàm t -> điểm, thay cách khớp từ khóa bằng độ giống embedding."""
     if len(tables) <= max_tables:
         return tables
     qwords = set(re.findall(r"[a-z0-9]+", strip_accents(question).lower()))
 
     def score(t):
+        if scorer is not None:
+            return scorer(t)
         blob = " ".join([t["name"]] + [c[0] for c in t["cols"]] + [str(c[1]) for c in t["cols"]])
         blob_words = set(re.findall(r"[a-z0-9]+", strip_accents(blob).lower()))
         return len(qwords & blob_words)
@@ -174,7 +177,7 @@ def select_tables(question: str, tables, max_tables=10, small_cols=6):
     return [t for t in tables if t["name"] in names]  # giữ thứ tự gốc
 
 
-def schema_text(db_path: Path, tables, n_examples=2) -> str:
+def schema_text(db_path: Path, tables, n_examples=2, expand=False) -> str:
     """Schema dạng CREATE TABLE + chú thích 'example: [...]' (đúng kiểu OmniSQL được huấn luyện)."""
     con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
     out = []
@@ -192,6 +195,11 @@ def schema_text(db_path: Path, tables, n_examples=2) -> str:
             notes = []
             if orig_name != cname:
                 notes.append(f"original header: {orig_name}")
+            if expand:
+                from abbrev import expand_header
+                m = expand_header(str(orig_name)) or (expand_header(cname) if orig_name == cname else None)
+                if m:
+                    notes.append(f"meaning: {m}")
             if ex:
                 notes.append(f"example: [{ex}]")
             decls.append((f"{cname} {ty}", ", ".join(notes)))

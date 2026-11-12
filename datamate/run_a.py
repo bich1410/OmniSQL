@@ -1,6 +1,8 @@
 """Nấc A + Bước 1: OmniSQL-7B sinh n SQL (1 greedy + n-1 lấy mẫu) -> chạy trên SQLite
 -> định dạng đáp án -> BỎ PHIẾU giữa các candidate -> abstain nếu độ đồng thuận thấp.
-(--n 1 cho đúng hành vi nấc A cũ: một SQL greedy, SQL lỗi / kết quả rỗng thì abstain.)
+(--n 1 và không bật cờ nào = đúng hành vi nấc A cũ: một SQL greedy, SQL lỗi / kết quả rỗng thì abstain.)
+Bước 2: --expand  bung chữ viết tắt (tên cột trong schema + câu hỏi kiểu chat)
+Bước 3: --link    chọn bảng bằng embedding thay vì khớp từ khóa (--embedder bge|hash)
 
 Dùng:
   python run_a.py --split_dir /kaggle/input/<ten-dataset>/public_test \
@@ -13,6 +15,7 @@ import time
 from collections import defaultdict
 from pathlib import Path
 
+from abbrev import normalize_question
 from common import (build_db, build_prompt, extract_sql, read_jsonl, read_text, run_sql,
                     schema_text, select_rulebook, select_tables, to_answer, write_jsonl)
 from vote import apply_threshold, vote
@@ -25,20 +28,50 @@ def est_tokens(s: str) -> int:
     return int(len(s) / CHARS_PER_TOKEN)
 
 
-def fit_prompt(tables_info, question, as_of, readme, rulebook):
+def fit_prompt(tables_info, question, as_of, readme, rulebook, expand=False, scorer=None):
     """Co dần các phần phụ cho tới khi prompt vừa ngân sách token.
     Bảng chọn theo liên quan câu hỏi (select_tables) vì nhiều business có 20-28 bảng
     (mỗi file/sheet Excel một bảng) -> schema một mình đã vượt ngân sách.
     Rulebook chọn theo mục liên quan câu hỏi (select_rulebook), không cắt thô."""
     for max_t, n_ex, rb_lim, rd_lim in [(12, 2, 6000, 1500), (8, 1, 3000, 800),
                                          (6, 1, 1500, 400), (4, 0, 600, 0)]:
-        tables = select_tables(question, tables_info["tables"], max_tables=max_t)
-        schema = schema_text(tables_info["db"], tables, n_examples=n_ex)
+        tables = select_tables(question, tables_info["tables"], max_tables=max_t, scorer=scorer)
+        schema = schema_text(tables_info["db"], tables, n_examples=n_ex, expand=expand)
         rb = select_rulebook(question, rulebook, rb_lim)
         p = build_prompt(schema, question, as_of, readme[:rd_lim], rb)
         if est_tokens(p) <= MAX_PROMPT_TOKENS:
             return p
     return p  # đành chịu; log sẽ cho biết
+
+
+_ENGINES = {}   # nạp model một lần cho cả tiến trình (run_all.py chạy nhiều cấu hình liên tiếp)
+
+
+def _vllm_engine(model, tp):
+    if ("vllm", model, tp) not in _ENGINES:
+        from transformers import AutoTokenizer
+        from vllm import LLM
+        tok = AutoTokenizer.from_pretrained(model)
+        llm = LLM(model=model, dtype="float16", tensor_parallel_size=tp, max_model_len=8192,
+                  gpu_memory_utilization=0.90, swap_space=8, enforce_eager=True,
+                  disable_custom_all_reduce=True, trust_remote_code=True)
+        _ENGINES[("vllm", model, tp)] = (tok, llm)
+    return _ENGINES[("vllm", model, tp)]
+
+
+def _hf_engine(model, quant):
+    if ("hf", model, quant) not in _ENGINES:
+        import torch
+        from transformers import AutoModelForCausalLM, AutoTokenizer
+        tok = AutoTokenizer.from_pretrained(model)
+        tok.padding_side = "left"
+        kw = {}
+        if quant == "4bit":   # Colab T4 1 GPU: 7B fp16 (~15GB) không vừa, nén 4-bit còn ~5GB
+            from transformers import BitsAndBytesConfig
+            kw["quantization_config"] = BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_compute_dtype=torch.float16)
+        mdl = AutoModelForCausalLM.from_pretrained(model, torch_dtype=torch.float16, device_map="auto", **kw)
+        _ENGINES[("hf", model, quant)] = (tok, mdl)
+    return _ENGINES[("hf", model, quant)]
 
 
 def generate(prompts, backend, model, batch_size, n=4, temperature=0.7,
@@ -55,12 +88,8 @@ def generate(prompts, backend, model, batch_size, n=4, temperature=0.7,
             res.append([f"```sql\n{s}\n```" for s in sqls])
         return res
     if backend == "vllm":
-        from transformers import AutoTokenizer
-        from vllm import LLM, SamplingParams
-        tok = AutoTokenizer.from_pretrained(model)
-        llm = LLM(model=model, dtype="float16", tensor_parallel_size=tp, max_model_len=8192,
-                  gpu_memory_utilization=0.90, swap_space=8, enforce_eager=True,
-                  disable_custom_all_reduce=True, trust_remote_code=True)
+        from vllm import SamplingParams
+        tok, llm = _vllm_engine(model, tp)
         chats = [tok.apply_chat_template([{"role": "user", "content": p}],
                                          add_generation_prompt=True, tokenize=False) for p in prompts]
         res = [[o.outputs[0].text] for o in
@@ -73,14 +102,7 @@ def generate(prompts, backend, model, batch_size, n=4, temperature=0.7,
         return res
     # backend "hf": chậm hơn nhưng ít lỗi cài đặt hơn (dùng khi vLLM không cài được)
     import torch
-    from transformers import AutoModelForCausalLM, AutoTokenizer
-    tok = AutoTokenizer.from_pretrained(model)
-    tok.padding_side = "left"
-    kw = {}
-    if quant == "4bit":   # Colab T4 1 GPU: 7B fp16 (~15GB) không vừa, nén 4-bit còn ~5GB
-        from transformers import BitsAndBytesConfig
-        kw["quantization_config"] = BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_compute_dtype=torch.float16)
-    mdl = AutoModelForCausalLM.from_pretrained(model, torch_dtype=torch.float16, device_map="auto", **kw)
+    tok, mdl = _hf_engine(model, quant)
     order = sorted(range(len(prompts)), key=lambda i: len(prompts[i]))
     res = [None] * len(prompts)
     for s in range(0, len(order), batch_size):
@@ -103,7 +125,32 @@ def generate(prompts, backend, model, batch_size, n=4, temperature=0.7,
     return res
 
 
-def main():
+def spread_sample(questions, limit):
+    """Lấy `limit` câu xen kẽ đều giữa các business (thay vì N câu đầu có thể chỉ thuộc 1-2 business)."""
+    by = defaultdict(list)
+    for q in questions:
+        by[q["business_id"]].append(q)
+    pools = [list(by[b]) for b in sorted(by)]
+    out = []
+    while len(out) < limit and any(pools):
+        for p in pools:
+            if p and len(out) < limit:
+                out.append(p.pop(0))
+    return out
+
+
+def load_or_build(biz_dir, work, reuse):
+    """build_db có cache: nạp dữ liệu vào SQLite tốn thời gian, các lần chạy ablation dùng lại được."""
+    meta = work / f"{biz_dir.name}.tables.json"
+    if reuse and meta.exists() and (work / f"{biz_dir.name}.db").exists():
+        d = json.load(open(meta, encoding="utf-8"))
+        return Path(d["db"]), [{"name": t["name"], "cols": [tuple(c) for c in t["cols"]]} for t in d["tables"]]
+    db, tables = build_db(biz_dir, work)
+    json.dump({"db": str(db), "tables": tables}, open(meta, "w", encoding="utf-8"), ensure_ascii=False)
+    return db, tables
+
+
+def build_parser():
     ap = argparse.ArgumentParser()
     ap.add_argument("--split_dir", required=True)
     ap.add_argument("--out", required=True)
@@ -120,14 +167,22 @@ def main():
     ap.add_argument("--temperature", type=float, default=0.7, help="nhiệt độ cho các bản lấy mẫu")
     ap.add_argument("--threshold", type=float, default=0.5,
                     help="chỉ trả lời khi độ đồng thuận >= ngưỡng. 0.5 chỉ là giá trị TẠM, chọn bằng calibrate.py")
-    a = ap.parse_args()
+    ap.add_argument("--expand", action="store_true", help="Bước 2: bung viết tắt (tên cột + câu hỏi)")
+    ap.add_argument("--link", action="store_true", help="Bước 3: chọn bảng bằng embedding")
+    ap.add_argument("--embedder", choices=["bge", "hash"], default="bge", help="model embedding cho --link")
+    ap.add_argument("--spread", action="store_true", help="--limit lấy câu xen kẽ đều giữa các business")
+    ap.add_argument("--reuse_db", action="store_true", help="dùng lại SQLite đã nạp ở work_dir (cho nhiều lần chạy)")
+    return ap
+
+
+def run(a):
 
     split = Path(a.split_dir)
     work = Path(a.work_dir)
     log_dir = Path(a.log_dir) if a.log_dir else Path(a.out).parent / "logs"
     questions = read_jsonl(split / "questions.jsonl")
     if a.limit:
-        questions = questions[: a.limit]
+        questions = spread_sample(questions, a.limit) if a.spread else questions[: a.limit]
     rulebook = read_text(split / "rulebook.md", 20000)   # rulebook của CHÍNH split này (đề yêu cầu)
 
     t_start = time.time()
@@ -135,12 +190,17 @@ def main():
     for q in questions:
         by_biz[q["business_id"]].append(q)
 
+    linker = None
+    if a.link:
+        from link import TableLinker, get_embedder
+        linker = TableLinker(get_embedder(a.embedder), expand=a.expand)
+
     prompts, metas = [], []
     for biz, qs in by_biz.items():
         t0 = time.time()
         biz_dir = split / "data" / biz
         try:
-            db, tables = build_db(biz_dir, work)
+            db, tables = load_or_build(biz_dir, work, a.reuse_db)
         except Exception as e:  # dữ liệu hỏng: abstain cả business, không làm sập cả lượt chạy
             print(f"[{biz}] LỖI nạp dữ liệu: {e}")
             for q in qs:
@@ -150,7 +210,10 @@ def main():
         info = {"db": db, "tables": tables}
         readme = read_text(biz_dir / "README.md", 20000)
         for q in qs:
-            prompts.append(fit_prompt(info, q["question"], q.get("as_of_date", ""), readme, rulebook))
+            qtext = normalize_question(q["question"]) if a.expand else q["question"]   # chỉ cho prompt;
+            scorer = linker.scorer(biz, tables, qtext) if linker else None             # to_answer vẫn dùng câu gốc
+            prompts.append(fit_prompt(info, qtext, q.get("as_of_date", ""), readme, rulebook,
+                                      expand=a.expand, scorer=scorer))
             metas.append({"q": q, "db": db, "err": None})
         print(f"[{biz}] {len(tables)} bảng, {len(qs)} câu, nạp {time.time() - t0:.1f}s")
 
@@ -203,7 +266,13 @@ def main():
     write_jsonl(Path(a.out), submission)
     write_jsonl(log_dir / "logs.jsonl", logs)
     n_abs = sum(1 for s in submission if s["type"] == "abstain")
+    json.dump({**vars(a), "date": time.strftime("%Y-%m-%d %H:%M:%S"), "seconds": round(time.time() - t_start)},
+              open(log_dir / "config.json", "w", encoding="utf-8"), ensure_ascii=False, indent=1)  # ghi lại cấu hình lần chạy
     print(f"Xong {len(submission)} câu | abstain {n_abs} | {time.time() - t_start:.0f}s | -> {a.out}")
+
+
+def main(argv=None):
+    run(build_parser().parse_args(argv))
 
 
 if __name__ == "__main__":

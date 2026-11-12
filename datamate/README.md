@@ -20,3 +20,13 @@ tin số điểm nấc A để so sánh với B/C/D/E, nên:
 1. Chạy A/B so sánh vài phương án trên tập train (có `answers.jsonl` thật, chấm
    bằng `score.py`) để chọn cách lọc tốt nhất bằng số liệu, không đoán.
 2. Xem `logs/logs.jsonl` để biết câu nào bị bỏ sót bảng/luật cần thiết do lọc sai.
+
+## Bước 1–3 và ablation
+
+- **Bước 1** (`vote.py`): sinh `--n` SQL (1 greedy + n-1 lấy mẫu), bỏ phiếu theo *kết quả chạy*, abstain khi độ đồng thuận < `--threshold`.
+- **Bước 2** (`abbrev.py`, cờ `--expand`): bung tên cột viết tắt (`meaning: SL=số lượng`) và chuẩn hóa chữ viết tắt trong câu hỏi.
+  Từ điển là bản khởi đầu, bổ sung theo danh sách "chưa phủ" mà `run_all.py` in ra.
+- **Bước 3** (`link.py`, cờ `--link`): chọn bảng bằng embedding (BGE-M3 trên CPU) thay vì khớp từ khóa; chỉ có tác dụng với business có nhiều bảng.
+- `run_all.py` chạy 4 cấu hình (base / expand / link / expand_link) một lần, lưu mỗi cấu hình vào `results`-style thư mục
+  (`save_run.py`), in bảng so sánh. Trên Kaggle: `kaggle_ablation.ipynb` hoặc `!bash kaggle_run.sh`.
+- Test: `cd tests && python test_score.py && python test_vote.py && python test_abbrev.py && python test_link.py`.
