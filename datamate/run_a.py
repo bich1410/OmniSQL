@@ -53,7 +53,7 @@ def _vllm_engine(model, tp):
         from vllm import LLM
         tok = AutoTokenizer.from_pretrained(model)
         llm = LLM(model=model, dtype="float16", tensor_parallel_size=tp, max_model_len=8192,
-                  gpu_memory_utilization=0.90, swap_space=8, enforce_eager=True,
+                  gpu_memory_utilization=0.90, enforce_eager=True,
                   disable_custom_all_reduce=True, trust_remote_code=True)
         _ENGINES[("vllm", model, tp)] = (tok, llm)
     return _ENGINES[("vllm", model, tp)]
