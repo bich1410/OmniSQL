@@ -9,6 +9,12 @@ LIMIT=${1:-100}
 NCAND=${3:-4}      # số candidate mỗi câu (1 = chỉ greedy, nhanh)
 ONLY=${2:-}        # ví dụ: fix,fix_zero (bỏ trống = 4 cấu hình ablation cũ)
 
+if [ "$1" = "inspect" ]; then   # khảo sát dữ liệu thô, không cần GPU/vLLM
+  TRAIN=$(python -c "import glob,os; c=sorted(glob.glob('/kaggle/input/**/train/questions.jsonl', recursive=True)); print(os.path.dirname(c[0]))")
+  python inspect_data.py "$TRAIN" /kaggle/working/inspect.txt
+  exit 0
+fi
+
 echo "== 1/4 cài vLLM (nếu lỗi sẽ tự dùng backend hf, chậm hơn)"
 pip install -q vllm 2>&1 | tail -2
 BACKEND=vllm
