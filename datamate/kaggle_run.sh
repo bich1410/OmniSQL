@@ -6,6 +6,7 @@
 # Cần: Accelerator = GPU T4 x2, Internet = On, Add Input = dataset chứa thư mục train/ của đề.
 cd "$(dirname "$0")"
 LIMIT=${1:-100}
+NCAND=${3:-4}      # số candidate mỗi câu (1 = chỉ greedy, nhanh)
 ONLY=${2:-}        # ví dụ: fix,fix_zero (bỏ trống = 4 cấu hình ablation cũ)
 
 echo "== 1/4 cài vLLM (nếu lỗi sẽ tự dùng backend hf, chậm hơn)"
@@ -29,7 +30,7 @@ echo "train = $TRAIN | backend = $BACKEND | số GPU = $TP | số câu = $LIMIT"
 
 echo "== 3/4 chạy ablation (4 cấu hình, nạp model một lần)"
 python run_all.py --split_dir "$TRAIN" --out_root /kaggle/working/runs --work_dir /kaggle/working/work \
-    --backend $BACKEND --tp $TP --limit $LIMIT --n 4 ${ONLY:+--only $ONLY}
+    --backend $BACKEND --tp $TP --limit $LIMIT --n $NCAND ${ONLY:+--only $ONLY}
 
 echo "== 4/4 đóng gói kết quả"
 python -c "import shutil; print(shutil.make_archive('/kaggle/working/ablation_results', 'zip', '/kaggle/working/runs'))"

@@ -55,6 +55,12 @@ def save(run_dir, ref, questions, quiet=False):
     (run / "score_vote.txt").write_text(s_vote + "\n", encoding="utf-8")
     (run / "calibrate.txt").write_text(calib + "\n", encoding="utf-8")
 
+    try:                                              # chẩn đoán từng câu (đáp án chuẩn vs dự đoán)
+        import diagnose
+        diagnose.write(run, ref, questions)
+    except Exception as e:
+        print("diagnose lỗi:", e)
+
     commit = sh(["git", "rev-parse", "--short", "HEAD"])
     cov, acc = cov_acc(s_vote)
     meta = {"run": run.name, "config": cfg, "n_questions": len(logs),
