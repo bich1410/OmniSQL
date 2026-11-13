@@ -24,6 +24,9 @@ COLUMN_ABBREV = {
     "ln": "lợi nhuận", "tl": "tỷ lệ", "kl": "khối lượng", "cp": "chi phí", "vc": "vận chuyển",
     "pvc": "phí vận chuyển", "dvvc": "đơn vị vận chuyển", "cod": "thu hộ khi giao hàng (COD)",
     "dm": "danh mục", "lh": "lô hàng / liên hệ", "bh": "bảo hành / bán hàng",
+    # bổ sung từ danh sách "chưa phủ" của dữ liệu train thật (dv 6 lần, hh 4, gd 3, cccd 3)
+    "dv": "đơn vị / dịch vụ", "hh": "hàng hóa", "gd": "giao dịch", "cccd": "căn cước công dân",
+    "cmnd": "chứng minh nhân dân", "tk": "tài khoản", "ds": "doanh số / danh sách",
 }
 
 # từ trong CÂU HỎI (giữ nguyên dấu nếu có), thay bằng dạng đầy đủ
@@ -32,6 +35,7 @@ QUESTION_ABBREV = {
     "j": "gì", "trc": "trước", "vs": "với", "bn": "bao nhiêu", "ntn": "như thế nào",
     "sl": "số lượng", "kh": "khách hàng", "nv": "nhân viên", "dt": "doanh thu",
     "ln": "lợi nhuận", "hd": "hóa đơn", "ncc": "nhà cung cấp", "mh": "mặt hàng",
+    "thg": "tháng", "hh": "hàng hóa", "gd": "giao dịch", "dv": "đơn vị",
 }
 
 # từ ngắn hay gặp nhưng KHÔNG phải viết tắt (để báo cáo "chưa phủ" đỡ nhiễu)
