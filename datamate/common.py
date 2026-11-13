@@ -212,6 +212,101 @@ def schema_text(db_path: Path, tables, n_examples=2, expand=False) -> str:
     return "\n".join(out)
 
 
+# ------------------------------------------------- gợi ý giá trị ô + sửa SQL (cờ --hints / --repair)
+# Log thực tế (100 câu train): ~21% SQL lỗi, 62/85 lỗi là "no such column"; nhiều SQL chạy được nhưng
+# lọc theo chuỗi/ngày đoán sai ('__ thg 02 2026', 'Thuoc la Vinataba') nên ra rỗng hoặc 0.
+FIX_NOTES = (
+    "Notes for this database:\n"
+    "- Use ONLY table and column names exactly as written in the schema above (lowercase, no diacritics). "
+    "Never invent a column.\n"
+    "- Vietnamese: 'quý N' = quarter N (quý 1 = months 1-3, quý 2 = 4-6, quý 3 = 7-9, quý 4 = 10-12); "
+    "'thg' in a date means 'tháng' (month); 'sp' = sản phẩm; 'dc' = được; 'ko' = không.\n"
+    "- Text cells may be stored without diacritics and dates may be stored as text. Copy value spellings "
+    "and date formats from the examples/hints, or match loosely with LIKE '%...%'."
+)
+
+_VAL_CACHE = {}   # (db, bảng, cột) -> [(giá trị, dạng chuẩn hóa, tập từ)]
+
+
+def _norm_val(s) -> str:
+    return re.sub(r"\s+", " ", strip_accents(str(s)).lower()).strip()
+
+
+def _col_values(db_path, tn, cn, cap=3000):
+    key = (str(db_path), tn, cn)
+    if key not in _VAL_CACHE:
+        con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        try:
+            vals = [r[0] for r in con.execute(
+                f'SELECT DISTINCT "{cn}" FROM "{tn}" WHERE "{cn}" IS NOT NULL LIMIT {cap}')]
+        except sqlite3.Error:
+            vals = []
+        finally:
+            con.close()
+        out = []
+        for v in vals:
+            if isinstance(v, str):
+                nv = _norm_val(v)
+                if 3 <= len(nv) <= 60:
+                    out.append((v, nv, frozenset(w for w in nv.split() if len(w) >= 3)))
+        _VAL_CACHE[key] = out
+    return _VAL_CACHE[key]
+
+
+_DATE_TXT = re.compile(r"^\d{1,2} thg \d{1,2} \d{4}$", re.I)
+
+
+def value_hints(db_path, tables, question, max_hits=8, per_col=2) -> str:
+    """Giá trị ô thật khớp với chữ trong câu hỏi (không phân biệt dấu) + định dạng ngày dạng chữ.
+    Giúp model viết đúng điều kiện lọc thay vì đoán chuỗi."""
+    qn = _norm_val(question)
+    qtok = {w for w in qn.split() if len(w) >= 3}
+    hits, dates = [], []
+    for t in tables:
+        tn = t["name"]
+        for cname, _orig, ctype in t["cols"]:
+            if "int" in ctype or ctype in ("real", "float", "double", "numeric"):
+                continue
+            vals = _col_values(db_path, tn, cname)
+            if vals and _DATE_TXT.match(vals[0][0]):
+                dates.append(f"- {tn}.{cname} stores dates as text like '{vals[0][0]}' (day thg month year). "
+                             f"Match with LIKE '% thg 8 2025' style patterns; month has no leading zero.")
+            found = []
+            for v, nv, toks in vals:
+                if nv in qn:
+                    found.append((2.0 + len(nv) / 100, v))
+                elif len(toks) >= 2:
+                    ov = len(toks & qtok)
+                    if ov >= 2 and ov / len(toks) >= 0.6:
+                        found.append((ov / len(toks), v))
+            found.sort(key=lambda x: -x[0])
+            for sc, v in found[:per_col]:
+                hits.append((sc, f"- {tn}.{cname} contains the value '{_short(v, 60)}'"))
+    hits.sort(key=lambda x: -x[0])
+    lines = [h for _, h in hits[:max_hits]] + dates[:3]
+    if not lines:
+        return ""
+    return "Possible matching cell values / formats:\n" + "\n".join(lines)
+
+
+def fix_extra(db_path, tables, question) -> str:
+    h = value_hints(db_path, tables, question)
+    return FIX_NOTES + ("\n" + h if h else "")
+
+
+def repair_suffix(sql: str, kind: str, err, tables) -> str:
+    """Đoạn nối vào prompt gốc để model sửa SQL vừa thất bại (kind: error | empty | zero)."""
+    problem = {"error": f"it failed with: {err}",
+               "empty": "it ran but returned no rows or NULL, so a filter probably does not match the stored values",
+               "zero": "it returned 0; check that the filters (text values, date formats) really match the stored values"}[kind]
+    used = {m.lower() for m in re.findall(r'(?i)\b(?:from|join)\s+"?(\w+)"?', sql or "")}
+    cols = [f"{t['name']}({', '.join(c[0] for c in t['cols'])})" for t in tables
+            if not used or t["name"].lower() in used]
+    return (f"\n\n---\nYour previous SQL:\n```sql\n{(sql or '')[:800]}\n```\nProblem: {str(problem)[:300]}.\n"
+            f"Exact columns of the tables involved: {'; '.join(cols)[:1000]}\n"
+            "Fix the SQL. Think briefly, then output only the corrected SQL in a ```sql code block.")
+
+
 def read_text(path: Path, limit: int) -> str:
     try:
         s = path.read_text(encoding="utf-8")
@@ -271,13 +366,14 @@ def select_rulebook(question: str, rulebook: str, char_cap: int) -> str:
     return text if len(text) <= char_cap else text[:char_cap] + "\n...[cắt bớt]"
 
 
-def build_prompt(schema: str, question: str, as_of: str, readme: str, rulebook: str) -> str:
+def build_prompt(schema: str, question: str, as_of: str, readme: str, rulebook: str, extra: str = "") -> str:
     """Ghi chú, rulebook và as_of_date đi vào phần 'external knowledge' của câu hỏi (README OmniSQL cho phép)."""
     knowledge = (
         f"Today's date (as-of date) is {as_of}. Use it to resolve relative dates such as "
         f"'tháng này', 'tuần rồi', 'hôm qua'.\n"
         f"Business notes (README):\n{readme}\n"
         f"Business rules (rulebook):\n{rulebook}"
+        + (f"\n{extra}" if extra else "")
     )
     q = f"{knowledge}\n\nQuestion: {question}"
     return PROMPT_TEMPLATE.format(db_details=schema, question=q)

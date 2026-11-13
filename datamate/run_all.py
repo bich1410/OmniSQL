@@ -8,6 +8,7 @@
   expand       + Bước 2 (bung viết tắt)
   link         + Bước 3 (chọn bảng bằng embedding)
   expand_link  + cả hai
+  fix, fix_zero  sửa theo phân tích lỗi: --hints + --repair (fix_zero: cả kết quả 0)
 Một cấu hình lỗi không làm hỏng các cấu hình còn lại. Kết quả mỗi cấu hình nằm ở <out_root>/<tên>_n<n>_<limit>/.
 """
 import argparse
@@ -26,6 +27,8 @@ CONFIGS = {
     "expand": ["--expand"],
     "link": ["--link"],
     "expand_link": ["--expand", "--link"],
+    "fix": ["--hints", "--repair"],                          # gợi ý giá trị ô + sửa SQL lỗi/rỗng
+    "fix_zero": ["--hints", "--repair", "--repair_zero"],    # như trên, kết quả 0 cũng sinh lại
 }
 
 
@@ -58,7 +61,8 @@ def main():
     split = Path(a.split_dir)
     ref, qs = split / "answers.jsonl", split / "questions.jsonl"
     out_root = Path(a.out_root)
-    names = [c for c in CONFIGS if not a.only or c in a.only.split(",")]
+    default = ["base", "expand", "link", "expand_link"]     # fix/fix_zero chỉ chạy khi chọn bằng --only
+    names = [c for c in CONFIGS if (c in a.only.split(",") if a.only else c in default)]
 
     unc = list_uncovered(headers_of(split))
     print("Chữ viết tắt trong tên cột CHƯA có trong từ điển (token, số lần):", unc[:25] or "không có")

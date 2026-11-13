@@ -3,6 +3,9 @@
 (--n 1 và không bật cờ nào = đúng hành vi nấc A cũ: một SQL greedy, SQL lỗi / kết quả rỗng thì abstain.)
 Bước 2: --expand  bung chữ viết tắt (tên cột trong schema + câu hỏi kiểu chat)
 Bước 3: --link    chọn bảng bằng embedding thay vì khớp từ khóa (--embedder bge|hash)
+Sửa lỗi (từ phân tích log): --hints   gợi ý giá trị ô thật + ghi chú tiếng Việt (quý, thg) + cấm bịa cột
+                            --repair  SQL lỗi/rỗng -> đưa lỗi lại cho model sinh lại (--repair_n bản)
+                            --repair_zero  coi kết quả 0 cũng là đáng ngờ, sinh lại
 
 Dùng:
   python run_a.py --split_dir /kaggle/input/<ten-dataset>/public_test \
@@ -16,8 +19,8 @@ from collections import defaultdict
 from pathlib import Path
 
 from abbrev import normalize_question
-from common import (build_db, build_prompt, extract_sql, read_jsonl, read_text, run_sql,
-                    schema_text, select_rulebook, select_tables, to_answer, write_jsonl)
+from common import (build_db, build_prompt, extract_sql, fix_extra, read_jsonl, read_text, repair_suffix,
+                    run_sql, schema_text, select_rulebook, select_tables, to_answer, write_jsonl)
 from vote import apply_threshold, vote
 
 CHARS_PER_TOKEN = 2.2          # ước lượng thô cho tiếng Việt, an toàn hơn tiếng Anh
@@ -28,8 +31,9 @@ def est_tokens(s: str) -> int:
     return int(len(s) / CHARS_PER_TOKEN)
 
 
-def fit_prompt(tables_info, question, as_of, readme, rulebook, expand=False, scorer=None):
-    """Co dần các phần phụ cho tới khi prompt vừa ngân sách token.
+def fit_prompt_ex(tables_info, question, as_of, readme, rulebook, expand=False, scorer=None,
+                  hints=False, budget=MAX_PROMPT_TOKENS):
+    """Co dần các phần phụ cho tới khi prompt vừa ngân sách token. Trả về (prompt, bảng đã chọn).
     Bảng chọn theo liên quan câu hỏi (select_tables) vì nhiều business có 20-28 bảng
     (mỗi file/sheet Excel một bảng) -> schema một mình đã vượt ngân sách.
     Rulebook chọn theo mục liên quan câu hỏi (select_rulebook), không cắt thô."""
@@ -38,10 +42,26 @@ def fit_prompt(tables_info, question, as_of, readme, rulebook, expand=False, sco
         tables = select_tables(question, tables_info["tables"], max_tables=max_t, scorer=scorer)
         schema = schema_text(tables_info["db"], tables, n_examples=n_ex, expand=expand)
         rb = select_rulebook(question, rulebook, rb_lim)
-        p = build_prompt(schema, question, as_of, readme[:rd_lim], rb)
-        if est_tokens(p) <= MAX_PROMPT_TOKENS:
-            return p
-    return p  # đành chịu; log sẽ cho biết
+        extra = fix_extra(tables_info["db"], tables, question) if hints else ""
+        p = build_prompt(schema, question, as_of, readme[:rd_lim], rb, extra)
+        if est_tokens(p) <= budget:
+            return p, tables
+    return p, tables  # đành chịu; log sẽ cho biết
+
+
+def fit_prompt(*args, **kw):
+    return fit_prompt_ex(*args, **kw)[0]
+
+
+def fail_kind(ans, err):
+    """Candidate thất bại kiểu gì: error (SQL lỗi) | empty (rỗng/NULL) | zero (kết quả 0) | None (dùng được)."""
+    if err:
+        return "error"
+    if ans.get("type") == "abstain":
+        return "empty"
+    if ans.get("type") in ("number", "percent") and ans.get("answer") == 0:
+        return "zero"
+    return None
 
 
 _ENGINES = {}   # nạp model một lần cho cả tiến trình (run_all.py chạy nhiều cấu hình liên tiếp)
@@ -125,6 +145,10 @@ def generate(prompts, backend, model, batch_size, n=4, temperature=0.7,
     return res
 
 
+def m_tables(meta):
+    return meta.get("tables", [])
+
+
 def spread_sample(questions, limit):
     """Lấy `limit` câu xen kẽ đều giữa các business (thay vì N câu đầu có thể chỉ thuộc 1-2 business)."""
     by = defaultdict(list)
@@ -170,6 +194,10 @@ def build_parser():
     ap.add_argument("--expand", action="store_true", help="Bước 2: bung viết tắt (tên cột + câu hỏi)")
     ap.add_argument("--link", action="store_true", help="Bước 3: chọn bảng bằng embedding")
     ap.add_argument("--embedder", choices=["bge", "hash"], default="bge", help="model embedding cho --link")
+    ap.add_argument("--hints", action="store_true", help="gợi ý giá trị ô khớp câu hỏi + ghi chú tiếng Việt")
+    ap.add_argument("--repair", action="store_true", help="SQL lỗi/rỗng -> sinh lại kèm thông báo lỗi")
+    ap.add_argument("--repair_zero", action="store_true", help="với --repair: kết quả 0 cũng sinh lại")
+    ap.add_argument("--repair_n", type=int, default=2, help="số bản sửa mỗi câu (1 greedy + còn lại lấy mẫu)")
     ap.add_argument("--spread", action="store_true", help="--limit lấy câu xen kẽ đều giữa các business")
     ap.add_argument("--reuse_db", action="store_true", help="dùng lại SQLite đã nạp ở work_dir (cho nhiều lần chạy)")
     return ap
@@ -212,9 +240,11 @@ def run(a):
         for q in qs:
             qtext = normalize_question(q["question"]) if a.expand else q["question"]   # chỉ cho prompt;
             scorer = linker.scorer(biz, tables, qtext) if linker else None             # to_answer vẫn dùng câu gốc
-            prompts.append(fit_prompt(info, qtext, q.get("as_of_date", ""), readme, rulebook,
-                                      expand=a.expand, scorer=scorer))
-            metas.append({"q": q, "db": db, "err": None})
+            budget = MAX_PROMPT_TOKENS - (1200 if a.repair else 0)   # chừa chỗ cho đoạn sửa lỗi
+            p, used_tables = fit_prompt_ex(info, qtext, q.get("as_of_date", ""), readme, rulebook,
+                                           expand=a.expand, scorer=scorer, hints=a.hints, budget=budget)
+            prompts.append(p)
+            metas.append({"q": q, "db": db, "err": None, "tables": used_tables})
         print(f"[{biz}] {len(tables)} bảng, {len(qs)} câu, nạp {time.time() - t0:.1f}s")
 
     live = [i for i, m in enumerate(metas) if m["err"] is None]
@@ -227,29 +257,72 @@ def run(a):
     raw = {i: o for i, o in zip(live, outs)}     # raw[i] = danh sách n chuỗi, [0] là greedy
     per_q = gen_s / max(1, len(live))
 
-    submission, logs, cache = [], [], {}
+    cache = {}
+
+    def exec_text(m, q, text):
+        """Tách SQL từ đầu ra model, chạy trên SQLite, đổi kết quả sang đáp án. Trả về (sql, đáp án, lỗi)."""
+        sql, ans, err = extract_sql(text), {"type": "abstain"}, None
+        if sql is None:
+            return sql, ans, "không tách được SQL"
+        key = (str(m["db"]), sql)             # nhiều candidate trùng SQL thì chỉ chạy một lần
+        if key not in cache:                  # chỉ cache kết quả chạy; to_answer còn phụ thuộc câu hỏi
+            try:
+                cache[key] = run_sql(m["db"], sql)
+            except Exception as e:
+                cache[key] = e
+        res_or_err = cache[key]
+        if isinstance(res_or_err, Exception):
+            return sql, ans, f"SQL lỗi: {res_or_err}"
+        return sql, to_answer(q["question"], *res_or_err), None
+
+    state = {}                                 # i -> (cands, cand_logs)
+    for i, m in enumerate(metas):
+        cands, cand_logs = [], []
+        for text in raw.get(i, []):
+            sql, ans, err = exec_text(m, m["q"], text)
+            cands.append(ans)
+            cand_logs.append({"sql": sql, "answer": ans, "error": err})
+        state[i] = (cands, cand_logs)
+
+    n_fixed = 0
+    if a.repair and live:                      # vòng sửa lỗi: đưa SQL thất bại + lý do lại cho model
+        kinds = ("error", "empty", "zero") if a.repair_zero else ("error", "empty")
+        jobs = []                              # (i, các chỉ số candidate cần sửa, prompt)
+        for i in live:
+            cands, cand_logs = state[i]
+            bad = [j for j, c in enumerate(cand_logs) if fail_kind(c["answer"], c["error"]) in kinds]
+            if not bad:
+                continue
+            j0 = bad[0]                        # sửa từ candidate thất bại đầu tiên (greedy nếu nó hỏng)
+            k0 = fail_kind(cand_logs[j0]["answer"], cand_logs[j0]["error"])
+            sfx = repair_suffix(cand_logs[j0]["sql"] or "(không có SQL)", k0, cand_logs[j0]["error"], m_tables(metas[i]))
+            jobs.append((i, bad, prompts[i] + sfx))
+        print(f"Sửa lỗi: {len(jobs)}/{len(live)} câu có candidate lỗi/rỗng"
+              f"{'/0' if a.repair_zero else ''}", flush=True)
+        if jobs:
+            routs = generate([p for _, _, p in jobs], a.backend, a.model, a.batch_size, n=a.repair_n,
+                             temperature=a.temperature, oracle=oracle,
+                             ids=[metas[i]["q"]["id"] + "#repair" for i, _, _ in jobs], tp=a.tp, quant=a.quant)
+            for (i, bad, _), outs_i in zip(jobs, routs):
+                cands, cand_logs = state[i]
+                for pos, j in enumerate(bad):
+                    old = dict(cand_logs[j])
+                    kind = fail_kind(old["answer"], old["error"])
+                    sql, ans, err = exec_text(metas[i], metas[i]["q"], outs_i[pos % len(outs_i)])
+                    if fail_kind(ans, err) is None:        # chỉ nhận bản sửa nếu ra đáp án dùng được
+                        cands[j] = ans
+                        cand_logs[j] = {"sql": sql, "answer": ans, "error": None,
+                                        "repaired_from": old["sql"], "repair_reason": kind}
+                        n_fixed += 1
+                    else:
+                        cand_logs[j]["repair_failed"] = kind
+        print(f"Đã sửa được {n_fixed} candidate", flush=True)
+
+    submission, logs = [], []
     for i, m in enumerate(metas):
         q = m["q"]
         t0 = time.time()
-        cands, cand_logs = [], []                 # đáp án + nhật ký từng candidate
-        for text in raw.get(i, []):
-            sql, ans, err = extract_sql(text), {"type": "abstain"}, None
-            if sql is None:
-                err = "không tách được SQL"
-            else:
-                key = (str(m["db"]), sql)         # nhiều candidate trùng SQL thì chỉ chạy một lần
-                if key not in cache:              # chỉ cache kết quả chạy; to_answer còn phụ thuộc câu hỏi
-                    try:
-                        cache[key] = run_sql(m["db"], sql)
-                    except Exception as e:
-                        cache[key] = e
-                res_or_err = cache[key]
-                if isinstance(res_or_err, Exception):
-                    err = f"SQL lỗi: {res_or_err}"
-                else:
-                    ans = to_answer(q["question"], *res_or_err)
-            cands.append(ans)
-            cand_logs.append({"sql": sql, "answer": ans, "error": err})
+        cands, cand_logs = state[i]
         if m["err"] is not None or not cands:    # lỗi nạp dữ liệu -> abstain cả câu
             voted, conf, win = {"type": "abstain"}, 0.0, None
         else:
